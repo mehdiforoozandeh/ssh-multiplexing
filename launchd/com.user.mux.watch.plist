@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.mux.watch</string>
+
+    <!-- Edit this path: launchd does not expand ~ -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOURNAME/.local/bin/mux-watch</string>
+    </array>
+
+    <!-- Fires within seconds of a network change. Switching wi-fi, toggling a
+         VPN, or tethering rewrites these files — and each of those events
+         kills the SSH master. This is why you learn about it immediately
+         rather than three commands into your next task. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/resolv.conf</string>
+        <string>/Library/Preferences/SystemConfiguration</string>
+    </array>
+
+    <!-- Backstop for the cases no file touch announces: sleep, and the remote
+         side going away underneath us. -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURNAME/.local/state/mux/watch.log</string>
+</dict>
+</plist>

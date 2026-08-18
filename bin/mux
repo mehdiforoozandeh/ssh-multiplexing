@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+#
+# mux — drive a multiplexed SSH connection to an MFA-protected host.
+#
+# Companion to the guide in this gist. Two rules it exists to enforce:
+#
+#   1. Every non-interactive path passes BatchMode=yes, so a dead master fails
+#      in two seconds instead of blocking forever on an MFA prompt that no
+#      script, cron job or agent can ever answer.
+#   2. A down tunnel exits 69 (EX_UNAVAILABLE), never 1 — so callers can tell
+#      "not connected" apart from "your command failed".
+#
+# Configure by listing your ssh_config Host aliases in HOSTS below, or in
+# ~/.config/mux/config.
+#
+set -euo pipefail
+
+CONFIG="${MUX_CONFIG:-$HOME/.config/mux/config}"
+EXCLUDES="${MUX_EXCLUDES:-$HOME/.config/mux/excludes}"
+
+# Defaults, overridable from $CONFIG.
+HOSTS="remote"                       # space-separated ssh_config Host aliases
+DEFAULT_HOST=""                      # empty = first entry in $HOSTS
+LOCAL_ROOT="$HOME/code"              # `mux push foo` syncs $LOCAL_ROOT/foo/
+REMOTE_ROOT=""                       # remote parent dir; empty = remote $HOME
+MAX_PULL=100M                        # `mux pull` skips anything larger
+
+[ -f "$CONFIG" ] && . "$CONFIG"
+: "${DEFAULT_HOST:=${HOSTS%% *}}"
+
+BATCH=(-o BatchMode=yes -o ConnectTimeout=10)
+EXARG=(); [ -f "$EXCLUDES" ] && EXARG=(--exclude-from="$EXCLUDES")
+
+die()  { printf 'mux: %s\n' "$*" >&2; exit 1; }
+note() { printf '\033[2m%s\033[0m\n' "$*" >&2; }
+
+valid_host() {
+    local h
+    for h in $HOSTS; do [ "$h" = "$1" ] && return 0; done
+    return 1
+}
+
+master_alive() { ssh -O check "$1" >/dev/null 2>&1; }
+
+require_master() {
+    master_alive "$1" && return 0
+    cat >&2 <<EOF
+mux: no live connection to $1.
+
+  Open a terminal and run:   mux up $1
+  Approve the MFA prompt once; every later command reuses that connection.
+EOF
+    exit 69   # EX_UNAVAILABLE — distinguishable from a real command failure
+}
+
+remote_dir() {
+    [ -n "$REMOTE_ROOT" ] && printf '%s/%s' "$REMOTE_ROOT" "$1" || printf '%s' "$1"
+}
+
+# ── commands ────────────────────────────────────────────────────────────
+
+cmd_up() {
+    local h="${1:-$DEFAULT_HOST}"
+    valid_host "$h" || die "unknown host '$h' (known: $HOSTS)"
+    if master_alive "$h"; then echo "$h: already connected"; return 0; fi
+    [ -t 0 ] || die "'mux up' needs a real terminal to show the MFA prompt."
+    echo "Connecting to $h — approve the MFA prompt."
+    ssh -f -N "$h"
+    master_alive "$h" && echo "$h: connected" || die "$h: connection failed"
+}
+
+cmd_down() {
+    local h targets
+    [ $# -gt 0 ] && targets="$*" || targets="$HOSTS"
+    for h in $targets; do
+        if master_alive "$h"; then
+            ssh -O exit "$h" 2>/dev/null && echo "$h: closed"
+        else
+            echo "$h: not connected"
+        fi
+    done
+}
+
+cmd_status() {
+    local h out=0
+    for h in $HOSTS; do
+        if master_alive "$h"; then
+            printf '%-12s up\n' "$h"
+        else
+            printf '%-12s down\n' "$h"; out=1
+        fi
+    done
+    return $out
+}
+
+cmd_run() {
+    local h="$DEFAULT_HOST"
+    if valid_host "${1:-}"; then h="$1"; shift; fi
+    [ $# -gt 0 ] || die "usage: mux run [host] '<command>'"
+    require_master "$h"
+    ssh "${BATCH[@]}" "$h" "$@"
+}
+
+# Add or remove a port forward on the LIVE master — no reconnection, no prompt.
+#   mux forward 8888                 -> -L 8888:localhost:8888
+#   mux forward 8888:localhost:8080
+#   mux forward --cancel 8888
+cmd_forward() {
+    local h="$DEFAULT_HOST" op=forward spec
+    [ "${1:-}" = "--cancel" ] && { op=cancel; shift; }
+    if valid_host "${1:-}"; then h="$1"; shift; fi
+    spec="${1:-}"
+    [ -n "$spec" ] || die "usage: mux forward [--cancel] [host] <port|lport:host:rport>"
+    case "$spec" in *:*) ;; *) spec="$spec:localhost:$spec" ;; esac
+    require_master "$h"
+    ssh -O "$op" -L "$spec" "$h" && echo "$h: $op -L $spec"
+}
+
+cmd_push() {
+    local h="$DEFAULT_HOST" project delete=()
+    [ "${1:-}" = "--delete" ] && { delete=(--delete); shift; }
+    project="${1:-}"
+    [ -n "$project" ] || die "usage: mux push [--delete] <project> [host]"
+    valid_host "${2:-}" && h="$2"
+    require_master "$h"
+
+    local src="$LOCAL_ROOT/$project/"
+    [ -d "$src" ] || die "no local project at $src"
+
+    # --no-g --no-p: on shared/quota'd filesystems, preserving group ownership
+    # and permissions can trip "Disk quota exceeded" or permission errors.
+    rsync -rlvzh --no-g --no-p --partial ${delete[@]+"${delete[@]}"} \
+        ${EXARG[@]+"${EXARG[@]}"} \
+        -e "ssh ${BATCH[*]}" \
+        "$src" "$h:$(remote_dir "$project")/"
+}
+
+cmd_pull() {
+    local h="$DEFAULT_HOST" project
+    project="${1:-}"
+    [ -n "$project" ] || die "usage: mux pull <project> [host]"
+    valid_host "${2:-}" && h="$2"
+    require_master "$h"
+
+    local rdir dst
+    rdir="$(remote_dir "$project")"
+    dst="$LOCAL_ROOT/$project/"
+    mkdir -p "$dst"
+
+    # Say out loud what the size guard will skip, so a missing file is never a
+    # silent mystery.
+    local big
+    big="$(ssh "${BATCH[@]}" "$h" \
+        "find '$rdir' -type f -size +$MAX_PULL 2>/dev/null | head -20" || true)"
+    if [ -n "$big" ]; then
+        note "skipping files over $MAX_PULL (they stay on $h):"
+        printf '  %s\n' $big >&2
+    fi
+
+    rsync -rlvzh --partial --max-size="$MAX_PULL" \
+        ${EXARG[@]+"${EXARG[@]}"} \
+        -e "ssh ${BATCH[*]}" \
+        "$h:$rdir/" "$dst"
+}
+
+cmd_help() {
+    cat <<'EOF'
+mux — one MFA prompt for the whole machine (SSH connection multiplexing)
+
+  mux up [host]                connect; approve MFA once (needs a terminal)
+  mux down [host...]           close the shared connection
+  mux status                   which hosts are currently reachable
+  mux run [host] '<cmd>'       run a command over the existing connection
+  mux forward [--cancel] [host] <port|lport:host:rport>
+                               add/remove a port forward on the live master
+  mux push [--delete] <project> [host]
+  mux pull <project> [host]    skips files over $MAX_PULL
+
+Config:   ~/.config/mux/config      (HOSTS, LOCAL_ROOT, REMOTE_ROOT, MAX_PULL)
+Excludes: ~/.config/mux/excludes    (rsync --exclude-from)
+
+Exit 69 means the tunnel is down — re-arm it with `mux up`, do not retry.
+EOF
+}
+
+# ── dispatch ────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    up)      shift; cmd_up "$@" ;;
+    down)    shift; cmd_down "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    run)     shift; cmd_run "$@" ;;
+    forward) shift; cmd_forward "$@" ;;
+    push)    shift; cmd_push "$@" ;;
+    pull)    shift; cmd_pull "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)       die "unknown command '$1' (try: mux help)" ;;
+esac

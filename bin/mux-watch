@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# mux-watch — notice the moment a multiplexed SSH master dies.
+#
+# This deliberately does NOT try to reconnect. An MFA challenge requires a
+# human to approve it, so silent re-authentication is impossible. What this
+# buys is immediate notice, instead of discovering the tunnel is down three
+# commands into a task.
+#
+# Run it from launchd (macOS) or a systemd user timer + NetworkManager
+# dispatcher hook (Linux). See com.user.mux.watch.plist in this gist.
+#
+set -uo pipefail
+
+STATE="${MUX_STATE:-$HOME/.local/state/mux}"
+CONFIG="${MUX_CONFIG:-$HOME/.config/mux/config}"
+HOSTS="remote"
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+mkdir -p "$STATE"
+export PATH="$HOME/.local/bin:/usr/bin:/bin"
+
+notify() {   # $1 = title, $2 = body
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "$1" "$2" >/dev/null 2>&1
+    fi
+    return 0
+}
+
+for h in $HOSTS; do
+    f="$STATE/$h.state"
+    prev="$(cat "$f" 2>/dev/null || echo unknown)"
+    if ssh -O check "$h" >/dev/null 2>&1; then now=up; else now=down; fi
+
+    [ "$now" = "$prev" ] && continue
+    printf '%s' "$now" > "$f"
+
+    [ "$prev" = up ] && [ "$now" = down ] && \
+        notify "$h disconnected" "Run  mux up $h  to reconnect"
+done
+
+# Nudge a menu-bar plugin to redraw, if one is installed.
+command -v open >/dev/null 2>&1 && \
+    open -g "swiftbar://refreshallplugins" >/dev/null 2>&1
+exit 0

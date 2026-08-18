@@ -1,0 +1,40 @@
+# Drop this into ~/.ssh/config (chmod 700 ~/.ssh) and replace the two
+# placeholders. Arm it once from a real terminal:  ssh -f -N remote
+
+Host remote
+    HostName remote.example.edu
+    User yourname
+
+    # ── the multiplexing core ──────────────────────────────────────────
+    ControlMaster auto
+    ControlPath   ~/.ssh/cm-%r@%h:%p
+    ControlPersist yes
+
+    # ── keep it alive across sleep and flaky wi-fi ─────────────────────
+    # 60s x 30 = 30 minutes of unanswered probes before giving up, so a
+    # closed lid under half an hour comes back to a live master.
+    ServerAliveInterval 60
+    ServerAliveCountMax 30
+    TCPKeepAlive no
+
+    # ── fail fast instead of hanging ───────────────────────────────────
+    ConnectTimeout 15
+
+    # Uncomment if you need these: forwarding options are fixed when the
+    # master is created, so a later `ssh -A` silently gets nothing.
+    # ForwardAgent yes
+    # ForwardX11   yes
+
+# If $HOME is on NFS, or hostnames are long enough to blow the 104-byte
+# socket-path limit, swap the ControlPath above for one of these:
+#     ControlPath ~/.ssh/cm-%C
+#     ControlPath /tmp/%r@%h:%p.sock
+
+# Multiplex both hops of a ProxyJump and the whole chain is one prompt.
+Host behind-bastion
+    HostName private.internal
+    User yourname
+    ProxyJump remote
+    ControlMaster auto
+    ControlPath   ~/.ssh/cm-%C
+    ControlPersist yes
