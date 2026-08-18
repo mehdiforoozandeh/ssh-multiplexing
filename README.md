@@ -204,8 +204,8 @@ never *create* one. Design for that asymmetry instead of fighting it.
 ## 7. Optional: make the connection state visible
 
 Because the master dies on network changes and you cannot auto-reconnect, the
-one thing worth building is **immediate notice**. Three small pieces, included
-in this repo:
+one thing worth building is **immediate notice**, and a glance-able signal of
+current state. Four small pieces, included in this repo:
 
 - **[`bin/mux`](bin/mux)** — a wrapper CLI: `mux up`, `mux status`, `mux run`, `mux push`,
   `mux pull`, `mux forward`. It enforces `BatchMode` on every non-interactive
@@ -219,6 +219,9 @@ in this repo:
   files are rewritten within seconds of any wi-fi, VPN, or tethering change —
   exactly the events that kill the master. So you learn the connection died
   roughly when it died, not three commands into your next task.
+- **[`swiftbar/sshmux.15s.sh`](swiftbar/sshmux.15s.sh)** — a menu-bar glyph
+  showing whether the master is live, with a one-click reconnect that opens a
+  real terminal for the MFA prompt. Covered below.
 
 All three read one config file, `~/.config/mux/config`
 ([example](examples/mux.config)):
@@ -231,14 +234,8 @@ REMOTE_ROOT="/home/yourname"    # remote parent dir; empty = remote $HOME
 MAX_PULL=100M                   # `mux pull` refuses anything larger
 ```
 
-A menu-bar indicator (SwiftBar, xbar, Übersicht, or a Waybar/i3blocks module on
-Linux) that shells out to `ssh -O check` closes the loop: a green dot means
-everything will just work, a grey one means re-arm before you start.
-
-Install the launchd agent with:
-
-Edit the two `/Users/YOURNAME/` paths in the plist first — `launchd` does not
-expand `~` — then:
+Install the launchd agent by editing the two `/Users/YOURNAME/` paths in the
+plist first — `launchd` does not expand `~` — then:
 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.mux.watch.plist
@@ -246,6 +243,67 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.mux.watch.plist
 
 On Linux, the equivalent is a systemd user timer plus a
 `NetworkManager-dispatcher` hook.
+
+### A menu-bar indicator, and why it is the piece that makes this pleasant
+
+Everything above is correct but invisible. You still have to *wonder* whether
+the connection is live, and you find out by running a command that fails. A
+menu-bar glyph closes that loop: **green means every tab, editor and sync will
+just work; grey means re-arm before you start.** You stop thinking about the
+connection at all, which is the actual goal.
+
+[`swiftbar/sshmux.15s.sh`](swiftbar/sshmux.15s.sh) is a working plugin for
+[SwiftBar](https://github.com/swiftbar/SwiftBar) (or
+[xbar](https://xbarapp.com) — same plugin API):
+
+```bash
+brew install --cask swiftbar
+# launch it once; it asks you to choose a plugin folder
+install -m 755 swiftbar/sshmux.15s.sh "$HOME/your/swiftbar/plugin/folder/"
+```
+
+That is the entire install. The filename carries the refresh interval —
+`sshmux.15s.sh` runs every 15 seconds — and the script's stdout *is* the UI:
+the line before `---` becomes the menu-bar glyph, everything after it becomes
+the dropdown. Nothing to compile, nothing to configure.
+
+Three details separate a decorative status light from something you actually
+rely on:
+
+- **Polling is free.** `ssh -O check` only talks to the local socket. It never
+  touches the network and can never trigger an authentication attempt, so a
+  15-second refresh costs nothing and will never surprise you with a Duo push.
+- **`terminal=true` is load-bearing.** The dropdown's *Connect…* item runs
+  `mux up` **in a real Terminal window**, because an MFA prompt needs a TTY —
+  a headless click would hang forever with nothing to type into. That one flag
+  is what turns "the tunnel died, go find a terminal, remember the command"
+  into a single click.
+- **The watcher pushes; the menu bar pulls.** `mux-watch` fires a notification
+  the moment the connection drops. The glyph reports current state whenever
+  you glance up. You want both: a notification you missed while away from the
+  desk is useless, and a glyph alone means you only learn the truth when you
+  happen to look.
+
+On Linux the same script drops behind a Waybar `custom/` module, an i3blocks
+block, a Polybar module, or GNOME's `argos`. The logic is only `ssh -O check`
+and an exit code, so the port is mostly reformatting the output.
+
+### What it actually feels like
+
+With the glyph, the watcher and `ControlPersist yes` all in place, a day looks
+like this:
+
+1. Open the laptop. Glance at the menu bar — grey.
+2. Click *Connect…*. A terminal opens, one Duo push, it closes itself. Green.
+3. Work. Terminal tabs, VS Code Remote-SSH, `rsync`, `git push`, a Jupyter
+   tunnel via `mux forward 8888` — every one instant and silent.
+   **Zero further prompts.**
+4. Move to café wi-fi. A notification appears within seconds and the glyph
+   goes grey. One click, one push, green again.
+
+The connection stops being something you manage and becomes something you
+glance at. For a setup whose whole promise is that the *machine* is connected
+rather than the session, that shift is the point.
 
 ---
 
@@ -346,6 +404,10 @@ mkdir -p ~/.config/mux && cp examples/mux.config ~/.config/mux/config
 sed "s|YOURNAME|$USER|g" launchd/com.user.mux.watch.plist \
     > ~/Library/LaunchAgents/com.user.mux.watch.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.mux.watch.plist
+
+# 7. (optional) the menu-bar glyph — green means everything just works
+brew install --cask swiftbar    # launch once, choose a plugin folder
+install -m 755 swiftbar/sshmux.15s.sh "$HOME/your/swiftbar/plugin/folder/"
 ```
 
 ---
@@ -361,6 +423,9 @@ The two things that keep it from becoming a liability are `BatchMode=yes` on
 every automated call — so a dead tunnel fails fast instead of hanging on a
 prompt nobody can answer — and a watcher that tells you the moment a network
 change kills the master, since MFA means no script can ever bring it back.
+
+Add the menu-bar glyph and the whole thing disappears into the background,
+which is the best thing infrastructure can do.
 
 ---
 
